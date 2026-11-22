@@ -1,0 +1,503 @@
+package com.myjarvis.app
+
+import android.app.Activity
+import android.app.AlertDialog
+import android.graphics.Color
+import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
+import android.os.Bundle
+import android.security.keystore.KeyGenParameterSpec
+import android.security.keystore.KeyProperties
+import android.text.InputType
+import android.util.Base64
+import android.view.Gravity
+import android.view.View
+import android.view.ViewGroup
+import android.widget.EditText
+import android.widget.LinearLayout
+import android.widget.ScrollView
+import android.widget.TextView
+import android.widget.Toast
+import org.json.JSONArray
+import org.json.JSONObject
+import java.io.File
+import java.net.HttpURLConnection
+import java.net.URL
+import java.security.KeyStore
+import javax.crypto.Cipher
+import javax.crypto.KeyGenerator
+import javax.crypto.SecretKey
+import javax.crypto.spec.GCMParameterSpec
+
+// ---------- মডেলের তালিকা (নতুন মডেল যোগ করতে শুধু এখানে লাইন বাড়াও) ----------
+data class AiModel(val label: String, val provider: String, val id: String)
+
+val MODELS = listOf(
+    AiModel("Claude Sonnet 5.5", "claude", "claude-sonnet-5-5"),
+    AiModel("Claude Haiku 5.5", "claude", "claude-haiku-5-5"),
+    AiModel("Gemini Flash", "gemini", "gemini-2.5-flash")
+)
+
+data class Msg(val role: String, val text: String, val model: String)
+
+const val DEFAULT_PERSONA =
+    "তুমি আমার পার্সোনাল AI সহকারী, বিশেষ করে ইলেকট্রনিক্স ও কোডিংয়ে। " +
+    "সবসময় বাংলায় উত্তর দাও (কোড ও টেকনিক্যাল শব্দ ইংরেজিতে থাকতে পারে)। " +
+    "আগে সংক্ষিপ্ত উত্তর, তারপর ধাপে ধাপে ব্যাখ্যা। কোড দিলে পুরো ফাইল দাও। " +
+    "আগের কিছু উত্তর অন্য AI মডেল দিয়ে থাকতে পারে; সেগুলোকে কথোপকথনের অংশ হিসেবে ধরো।"
+
+// ---------- API key এনক্রিপ্ট করে রাখার জন্য (Android Keystore) ----------
+object Vault {
+    private const val ALIAS = "myjarvis_key"
+
+    private fun key(): SecretKey {
+        val ks = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
+        (ks.getKey(ALIAS, null) as? SecretKey)?.let { return it }
+        val g = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, "AndroidKeyStore")
+        g.init(
+            KeyGenParameterSpec.Builder(
+                ALIAS, KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT
+            )
+                .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+                .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+                .build()
+        )
+        return g.generateKey()
+    }
+
+    fun enc(s: String): String {
+        val c = Cipher.getInstance("AES/GCM/NoPadding")
+        c.init(Cipher.ENCRYPT_MODE, key())
+        val out = c.iv + c.doFinal(s.toByteArray())
+        return Base64.encodeToString(out, Base64.NO_WRAP)
+    }
+
+    fun dec(s: String): String {
+        val b = Base64.decode(s, Base64.NO_WRAP)
+        val c = Cipher.getInstance("AES/GCM/NoPadding")
+        c.init(Cipher.DECRYPT_MODE, key(), GCMParameterSpec(128, b.copyOfRange(0, 12)))
+        return String(c.doFinal(b, 12, b.size - 12))
+    }
+}
+
+class MainActivity : Activity() {
+
+    private val BG = Color.parseColor("#141414")
+    private val CARD = Color.parseColor("#202020")
+    private val PILL = Color.parseColor("#2E2E2E")
+    private val USER_BG = Color.parseColor("#2F3B52")
+    private val AI_BG = Color.parseColor("#1E1E1E")
+
+    private val prefs by lazy { getSharedPreferences("jarvis", MODE_PRIVATE) }
+    private val messages = mutableListOf<Msg>()
+    private var selected = "All"
+
+    private lateinit var list: LinearLayout
+    private lateinit var scroll: ScrollView
+    private lateinit var input: EditText
+    private lateinit var modelBtn: TextView
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        window.statusBarColor = BG
+        window.navigationBarColor = BG
+        loadChat()
+        setContentView(buildUi())
+        messages.forEach { addBubble(it) }
+    }
+
+    // ---------- UI ----------
+    private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+    private fun round(color: Int, r: Int) = GradientDrawable().apply {
+        setColor(color)
+        cornerRadius = dp(r).toFloat()
+    }
+
+    private fun iconBtn(t: String, onClick: () -> Unit) = TextView(this).apply {
+        text = t
+        textSize = 20f
+        setPadding(dp(12), dp(8), dp(12), dp(8))
+        setOnClickListener { onClick() }
+    }
+
+    private fun buildUi(): View {
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(BG)
+            setPadding(dp(12), dp(12), dp(12), dp(8))
+        }
+
+        val top = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        top.addView(
+            TextView(this).apply {
+                text = "MyJarvis"
+                setTextColor(Color.WHITE)
+                textSize = 20f
+                typeface = Typeface.DEFAULT_BOLD
+            },
+            LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        )
+        top.addView(iconBtn("🗑") { confirmClear() })
+        top.addView(iconBtn("⚙") { showSettings() })
+        root.addView(top)
+
+        scroll = ScrollView(this)
+        list = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(0, 0, 0, dp(8))
+        }
+        scroll.addView(list)
+        root.addView(scroll, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+
+        // নিচের ইনপুট কার্ড
+        val card = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = round(CARD, 24)
+            setPadding(dp(14), dp(10), dp(10), dp(10))
+        }
+        input = EditText(this).apply {
+            hint = "মেসেজ লেখো…"
+            setHintTextColor(Color.GRAY)
+            setTextColor(Color.WHITE)
+            background = null
+            maxLines = 6
+            inputType = InputType.TYPE_CLASS_TEXT or
+                InputType.TYPE_TEXT_FLAG_MULTI_LINE or
+                InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
+        }
+        card.addView(input)
+
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        modelBtn = TextView(this).apply {
+            text = "$selected ▾"
+            setTextColor(Color.WHITE)
+            textSize = 14f
+            background = round(PILL, 20)
+            setPadding(dp(16), dp(10), dp(16), dp(10))
+            setOnClickListener { pickModel() }
+        }
+        row.addView(modelBtn)
+        row.addView(View(this), LinearLayout.LayoutParams(0, 1, 1f))
+
+        val sendBtn = TextView(this).apply {
+            text = "➤"
+            textSize = 18f
+            setTextColor(Color.BLACK)
+            gravity = Gravity.CENTER
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(Color.WHITE)
+            }
+            setOnClickListener { sendMessage() }
+        }
+        row.addView(sendBtn, LinearLayout.LayoutParams(dp(44), dp(44)))
+        card.addView(row)
+
+        root.addView(
+            card,
+            LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+        )
+        return root
+    }
+
+    private fun addBubble(m: Msg): TextView {
+        val isUser = m.role == "user"
+        val wrap = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        if (!isUser && m.model.isNotEmpty()) {
+            wrap.addView(TextView(this).apply {
+                text = m.model
+                setTextColor(Color.GRAY)
+                textSize = 11f
+                setPadding(dp(6), 0, 0, dp(2))
+            })
+        }
+        val tv = TextView(this).apply {
+            text = m.text
+            setTextColor(Color.WHITE)
+            textSize = 15f
+            setTextIsSelectable(true)
+            background = round(if (isUser) USER_BG else AI_BG, 16)
+            setPadding(dp(12), dp(8), dp(12), dp(8))
+            maxWidth = (resources.displayMetrics.widthPixels * 0.88).toInt()
+        }
+        wrap.addView(tv)
+        val lp = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT
+        ).apply {
+            topMargin = dp(8)
+            gravity = if (isUser) Gravity.END else Gravity.START
+        }
+        list.addView(wrap, lp)
+        scrollDown()
+        return tv
+    }
+
+    private fun scrollDown() {
+        scroll.post { scroll.fullScroll(View.FOCUS_DOWN) }
+    }
+
+    // ---------- মডেল বাছাই ----------
+    private fun pickModel() {
+        val names = listOf("All") + MODELS.map {
+            it.label + if (getKey(it.provider) == null) "  (key নেই)" else ""
+        }
+        AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+            .setTitle("কোন AI ব্যবহার করবে?")
+            .setItems(names.toTypedArray()) { _, i ->
+                selected = if (i == 0) "All" else MODELS[i - 1].label
+                modelBtn.text = "$selected ▾"
+            }
+            .show()
+    }
+
+    // ---------- মেসেজ পাঠানো ----------
+    private fun sendMessage() {
+        val text = input.text.toString().trim()
+        if (text.isEmpty()) return
+
+        val targets = MODELS.filter {
+            (selected == "All" || it.label == selected) && getKey(it.provider) != null
+        }
+        if (targets.isEmpty()) {
+            Toast.makeText(this, "আগে ⚙ সেটিংসে API key দাও", Toast.LENGTH_LONG).show()
+            return
+        }
+
+        input.setText("")
+        val um = Msg("user", text, "")
+        messages.add(um)
+        addBubble(um)
+        saveChat()
+
+        val history = buildHistory()
+        val persona = prefs.getString("persona", null)?.takeIf { it.isNotBlank() } ?: DEFAULT_PERSONA
+
+        for (t in targets) {
+            val tv = addBubble(Msg("assistant", "…", t.label))
+            Thread {
+                val res = runCatching { callModel(t, persona, history) }
+                runOnUiThread {
+                    res.onSuccess { r ->
+                        tv.text = r
+                        messages.add(Msg("assistant", r, t.label))
+                        saveChat()
+                    }
+                    res.onFailure { e -> tv.text = "⚠ ${t.label}: ${e.message}" }
+                    scrollDown()
+                }
+            }.start()
+        }
+    }
+
+    // আগের চ্যাট থেকে (role, text) তালিকা; পরপর একই role হলে জুড়ে দেয়
+    private fun buildHistory(): List<Pair<String, String>> {
+        val out = mutableListOf<Pair<String, String>>()
+        for (m in messages.takeLast(30)) {
+            if (out.isNotEmpty() && out.last().first == m.role) {
+                out[out.size - 1] = m.role to (out.last().second + "\n\n---\n\n" + m.text)
+            } else {
+                out.add(m.role to m.text)
+            }
+        }
+        while (out.isNotEmpty() && out.first().first != "user") out.removeAt(0)
+        return out
+    }
+
+    // ---------- API কল ----------
+    private fun callModel(m: AiModel, persona: String, hist: List<Pair<String, String>>): String {
+        val k = getKey(m.provider) ?: throw Exception("key নেই")
+        return if (m.provider == "claude") callClaude(m, k, persona, hist)
+        else callGemini(m, k, persona, hist)
+    }
+
+    private fun post(url: String, headers: Map<String, String>, body: String): String {
+        val c = URL(url).openConnection() as HttpURLConnection
+        c.requestMethod = "POST"
+        c.connectTimeout = 20000
+        c.readTimeout = 120000
+        c.doOutput = true
+        c.setRequestProperty("content-type", "application/json")
+        headers.forEach { (k, v) -> c.setRequestProperty(k, v) }
+        c.outputStream.use { it.write(body.toByteArray()) }
+        val code = c.responseCode
+        val stream = if (code in 200..299) c.inputStream else c.errorStream
+        val s = stream?.bufferedReader()?.readText() ?: ""
+        if (code !in 200..299) throw Exception("HTTP $code: " + s.take(300))
+        return s
+    }
+
+    private fun callClaude(
+        m: AiModel, key: String, persona: String, hist: List<Pair<String, String>>
+    ): String {
+        val msgs = JSONArray()
+        hist.forEach { msgs.put(JSONObject().put("role", it.first).put("content", it.second)) }
+        val body = JSONObject()
+            .put("model", m.id)
+            .put("max_tokens", 4096)
+            .put("system", persona)
+            .put("messages", msgs)
+            .toString()
+        val r = JSONObject(
+            post(
+                "https://api.anthropic.com/v1/messages",
+                mapOf("x-api-key" to key, "anthropic-version" to "2023-06-01"),
+                body
+            )
+        )
+        val arr = r.getJSONArray("content")
+        val sb = StringBuilder()
+        for (i in 0 until arr.length()) {
+            val o = arr.getJSONObject(i)
+            if (o.optString("type") == "text") sb.append(o.getString("text"))
+        }
+        return sb.toString().ifBlank { "(খালি উত্তর)" }
+    }
+
+    private fun callGemini(
+        m: AiModel, key: String, persona: String, hist: List<Pair<String, String>>
+    ): String {
+        val contents = JSONArray()
+        hist.forEach {
+            val role = if (it.first == "assistant") "model" else "user"
+            contents.put(
+                JSONObject().put("role", role)
+                    .put("parts", JSONArray().put(JSONObject().put("text", it.second)))
+            )
+        }
+        val body = JSONObject()
+            .put(
+                "systemInstruction",
+                JSONObject().put("parts", JSONArray().put(JSONObject().put("text", persona)))
+            )
+            .put("contents", contents)
+            .toString()
+        val r = JSONObject(
+            post(
+                "https://generativelanguage.googleapis.com/v1beta/models/${m.id}:generateContent",
+                mapOf("x-goog-api-key" to key),
+                body
+            )
+        )
+        val parts = r.getJSONArray("candidates").getJSONObject(0)
+            .getJSONObject("content").getJSONArray("parts")
+        val sb = StringBuilder()
+        for (i in 0 until parts.length()) sb.append(parts.getJSONObject(i).optString("text"))
+        return sb.toString().ifBlank { "(খালি উত্তর)" }
+    }
+
+    // ---------- সেটিংস ----------
+    private fun getKey(provider: String): String? {
+        val s = prefs.getString("key_$provider", null) ?: return null
+        return try { Vault.dec(s) } catch (e: Exception) { null }
+    }
+
+    private fun showSettings() {
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(10), dp(20), dp(10))
+        }
+
+        fun field(title: String, h: String, secret: Boolean, lines: Int = 1): EditText {
+            box.addView(TextView(this).apply {
+                text = title
+                setTextColor(Color.LTGRAY)
+                setPadding(0, dp(12), 0, 0)
+            })
+            val e = EditText(this).apply {
+                hint = h
+                setTextColor(Color.WHITE)
+                setHintTextColor(Color.GRAY)
+                inputType = if (secret) {
+                    InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+                } else {
+                    InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE
+                }
+                if (lines > 1) {
+                    minLines = lines
+                    gravity = Gravity.TOP
+                }
+            }
+            box.addView(e)
+            return e
+        }
+
+        fun keyHint(p: String) = getKey(p)?.let { "সংরক্ষিত আছে (••••${it.takeLast(4)})" }
+            ?: "API key পেস্ট করো"
+
+        val claudeF = field("Claude API key", keyHint("claude"), true)
+        val geminiF = field("Gemini API key", keyHint("gemini"), true)
+        val personaF = field("Persona (কীভাবে কথা বলবে)", "", false, 5)
+        personaF.setText(prefs.getString("persona", null)?.takeIf { it.isNotBlank() } ?: DEFAULT_PERSONA)
+
+        val sv = ScrollView(this).apply { addView(box) }
+
+        AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+            .setTitle("সেটিংস")
+            .setView(sv)
+            .setPositiveButton("সেভ") { _, _ ->
+                val e = prefs.edit()
+                val ck = claudeF.text.toString().trim()
+                val gk = geminiF.text.toString().trim()
+                try {
+                    if (ck.isNotEmpty()) e.putString("key_claude", Vault.enc(ck))
+                    if (gk.isNotEmpty()) e.putString("key_gemini", Vault.enc(gk))
+                } catch (ex: Exception) {
+                    Toast.makeText(this, "key সেভ হয়নি: ${ex.message}", Toast.LENGTH_LONG).show()
+                }
+                e.putString("persona", personaF.text.toString().trim())
+                e.apply()
+            }
+            .setNeutralButton("সব key মুছো") { _, _ ->
+                prefs.edit().remove("key_claude").remove("key_gemini").apply()
+            }
+            .setNegativeButton("বাদ", null)
+            .show()
+    }
+
+    // ---------- চ্যাট সংরক্ষণ (ধাপ ২-এ Documents/MyJarvis ফোল্ডারে যাবে) ----------
+    private fun chatFile() = File(filesDir, "chat.json")
+
+    private fun saveChat() {
+        val a = JSONArray()
+        messages.forEach {
+            a.put(JSONObject().put("r", it.role).put("t", it.text).put("m", it.model))
+        }
+        chatFile().writeText(a.toString())
+    }
+
+    private fun loadChat() {
+        try {
+            val f = chatFile()
+            if (!f.exists()) return
+            val a = JSONArray(f.readText())
+            for (i in 0 until a.length()) {
+                val o = a.getJSONObject(i)
+                messages.add(Msg(o.getString("r"), o.getString("t"), o.optString("m")))
+            }
+        } catch (e: Exception) {
+        }
+    }
+
+    private fun confirmClear() {
+        AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+            .setTitle("পুরো চ্যাট মুছবে?")
+            .setPositiveButton("মুছো") { _, _ ->
+                messages.clear()
+                list.removeAllViews()
+                saveChat()
+            }
+            .setNegativeButton("বাদ", null)
+            .show()
+    }
+}
